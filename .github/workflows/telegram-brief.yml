@@ -1,7 +1,7 @@
-name: telegram-brief
 on:
   schedule:
-    - cron: '30 5 * * *'   # 05:30 UTC = 08:30 Europe/Riga (summer). See DST note below.
+    - cron: '30 5 * * *'   # 08:30 Riga in summer
+    - cron: '30 6 * * *'   # 08:30 Riga in winter
   workflow_dispatch: {}
 jobs:
   run:
@@ -14,5 +14,12 @@ jobs:
       - run: pip install -r requirements.txt
       - env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}   # or TELEGRAM_CHAT_ID
+          LOCAL_TZ: Europe/Riga
+          STRICT_0830: '1'
+          SKIP_WEEKENDS: '0'
+          KEV_WINDOW_DAYS: '3'
+          EPSS_MIN: '0.7'
+          EPSS_LIMIT: '12'
+          FEED_COUNT: '4'
         run: python telegram_brief.py
