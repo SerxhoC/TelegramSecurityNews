@@ -1,155 +1,72 @@
-import os, re, time
+#!/usr/bin/env python3
+import os, time, json, logging
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from typing import List, Dict
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
 try:
     import feedparser  # pip install feedparser
 except Exception:
     feedparser = None
 
-# --------- Config from ENV (defaults stay conservative) ----------
-LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Riga")
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
-STRICT_0830 = os.getenv("STRICT_0830", "0") == "1"
-STRICT_0830_TOL_MIN = int(os.getenv("STRICT_0830_TOL_MIN", "7"))
-SKIP_WEEKENDS = os.getenv("SKIP_WEEKENDS", "0") == "1"
-
-KEV_WINDOW_DAYS = int(os.getenv("KEV_WINDOW_DAYS", "3"))
-EPSS_MIN = float(os.getenv("EPSS_MIN", "0.7"))
-EPSS_LIMIT = int(os.getenv("EPSS_LIMIT", "10"))
-
-# How many items to show
-HEADLINES_TOTAL = int(os.getenv("HEADLINES_TOTAL", "6"))
-VENDOR_TOTAL = int(os.getenv("VENDOR_TOTAL", "10"))
-FEED_MAX_PER_SOURCE = int(os.getenv("FEED_MAX_PER_SOURCE", "6"))
-
-# Limit news by recency
-HEADLINES_WINDOW_DAYS = int(os.getenv("HEADLINES_WINDOW_DAYS", "3"))
-VENDOR_WINDOW_DAYS = int(os.getenv("VENDOR_WINDOW_DAYS", "3"))
-
-# Keyword ranking (comma-separated)
-def _csv_env(name, default):
-    return [s.strip().lower() for s in os.getenv(name, default).split(",") if s.strip()]
-
-HEADLINE_KEYWORDS = _csv_env(
-    "HEADLINE_KEYWORDS",
-    "0-day,zero-day,actively exploited,exploited,exploit,weaponized,kev,cisa,patch tuesday,ransomware,supply chain"
-)
-STACK_KEYWORDS = _csv_env(
-    "STACK_KEYWORDS",
-    "microsoft,cisco,fortinet,ivanti,citrix,gitlab,jenkins,atlassian,confluence,vmware,exchange,sharepoint,globalprotect,pan-os,big-ip,f5,moveit,screenconnect,sonicwall,cloudflare,aws,azure,gcp,okta,nginx,apache"
-)
-
-# Feeds supplied from YAML (newline or comma separated). If empty, we fallback to minimal defaults.
-def _list_from_env(name, defaults):
-    raw = os.getenv(name, "").strip()
-    parts = []
-    if raw:
-        # support newline-separated block or CSV
-        for line in raw.splitlines():
-            for p in line.split(","):
-                p = p.strip()
-                if p.startswith("http"):
-                    parts.append(p)
-    if not parts:
-        parts = defaults[:]  # copy
-    return parts
-
-DEFAULT_HEADLINES = [
+# ---- Config ----
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_URL = "https://api.first.org/data/v1/epss?epss-gt=0.5&order=!epss&limit=1000"
+HEADLINE_FEEDS = [
     "https://www.bleepingcomputer.com/feed/",
     "https://www.darkreading.com/rss.xml",
-    "https://therecord.media/feed",
+    "https://therecord.media/feed/",
     "https://www.microsoft.com/en-us/security/blog/feed/",
     "https://blog.google/threat-analysis-group/rss/",
     "https://aws.amazon.com/blogs/security/feed/",
 ]
-HEADLINE_FEEDS = _list_from_env("HEADLINE_FEEDS", DEFAULT_HEADLINES)
+HEADLINES_TO_INCLUDE = 3
+MAX_MSG_LEN = 3900  # keep <4096 for Telegram
 
-# VENDOR_FEEDS: leave empty by default; you’ll provide in YAML
-VENDOR_FEEDS = _list_from_env("VENDOR_FEEDS", [])
+UA = {"User-Agent": "devsecops-brief/1.0 (+https://example.org)"}
 
-TELEGRAM_MAX = 3900  # keep under 4096
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-EPSS_URL = f"https://api.first.org/data/v1/epss?epss-gt={EPSS_MIN}&order=!epss&limit=1000"
-
-# ----------------------------- HTTP session -----------------------------------
-def make_session():
+def session_with_retries(total=4, backoff=0.5) -> requests.Session:
     s = requests.Session()
-    r = Retry(
-        total=3, backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
+    retries = Retry(
+        total=total,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
     )
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "DevSecOpsBrief/Pro/2.1 (+github-actions)"})
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.headers.update(UA)
     return s
 
-SESSION = make_session()
+S = session_with_retries()
 
-# ------------------------------- Helpers --------------------------------------
-def now_local():
-    return datetime.now(ZoneInfo(LOCAL_TZ))
-
-def within_0830_guard():
-    if not STRICT_0830:
-        return True
-    n = now_local()
-    if SKIP_WEEKENDS and n.weekday() >= 5:
-        return False
-    return (n.hour == 8) and (abs(n.minute - 30) <= STRICT_0830_TOL_MIN)
-
-def split_chunks(text: str, limit=TELEGRAM_MAX):
-    if len(text) <= limit:
-        return [text]
-    parts, buf, cur = [], [], 0
-    for ln in text.split("\n"):
-        ln_len = len(ln) + 1
-        if cur + ln_len > limit and buf:
-            parts.append("\n".join(buf))
-            buf, cur = [], 0
-        buf.append(ln)
-        cur += ln_len
-    if buf:
-        parts.append("\n".join(buf))
-    return parts
-
-def esc(s: str) -> str:
-    return (s or "").replace("\r", "").strip()
-
-def keyword_hit(s: str, keywords):
-    t = (s or "").lower()
-    return any(k in t for k in keywords)
-
-def _age_cut(ts, window_days):
-    cutoff = time.time() - window_days * 86400
-    return ts >= cutoff
-
-# ------------------------------- Collectors -----------------------------------
-def get_kev(window_days=KEV_WINDOW_DAYS):
-    since = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
-    r = SESSION.get(KEV_URL, timeout=30)
+def get_kev_last_24h() -> List[Dict]:
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+    r = S.get(KEV_URL, timeout=30)
     r.raise_for_status()
-    vulns = r.json().get("vulnerabilities", [])
+    data = r.json()
+    vulns = data.get("vulnerabilities", [])
     out = []
     for v in vulns:
-        if (v.get("dateAdded") or "") >= since:
+        # dateAdded is YYYY-MM-DD — string compare with same format is OK
+        if (v.get("dateAdded") or "") >= cutoff_date:
             out.append({
                 "cve": v.get("cveID"),
                 "vendor": v.get("vendorProject"),
                 "product": v.get("product"),
                 "desc": (v.get("shortDescription") or "").strip(),
-                "dateAdded": v.get("dateAdded"),
             })
-    out.sort(key=lambda x: (x.get("dateAdded") or "", x.get("cve") or ""), reverse=True)
     return out
 
-def get_epss():
-    r = SESSION.get(EPSS_URL, timeout=30)
+def get_epss_high() -> List[Dict]:
+    r = S.get(EPSS_URL, timeout=30)
     r.raise_for_status()
     data = r.json().get("data", [])
     out = []
@@ -157,155 +74,116 @@ def get_epss():
         try:
             epss = float(d.get("epss", "0"))
             pct = float(d.get("percentile", "0"))
+            out.append({"cve": d["cve"], "epss": epss, "pct": pct})
         except Exception:
             continue
-        if epss >= EPSS_MIN:
-            out.append({"cve": d.get("cve"), "epss": epss, "pct": pct})
     out.sort(key=lambda x: x["epss"], reverse=True)
     return out
 
-def parse_feeds(urls, window_days, total_limit, max_per_source=FEED_MAX_PER_SOURCE, boost_keywords=None):
+def safe_top_headlines(n=3) -> List[Dict]:
     if not feedparser:
+        logging.warning("feedparser not installed; skipping headlines.")
         return []
     items = []
-    for url in urls:
+    for url in HEADLINE_FEEDS:
         try:
-            f = feedparser.parse(url)
-            cnt = 0
-            for e in f.entries:
-                if cnt >= max_per_source:
-                    break
-                # timestamp best-effort
-                ts = 0
+            f = feedparser.parse(url, request_headers=UA)
+            for e in f.entries[:6]:
+                ts = None
                 if getattr(e, "published_parsed", None):
                     ts = time.mktime(e.published_parsed)
                 elif getattr(e, "updated_parsed", None):
                     ts = time.mktime(e.updated_parsed)
-                if ts and not _age_cut(ts, window_days):
-                    continue
-                items.append({
-                    "title": esc(getattr(e, "title", "")),
-                    "link": esc(getattr(e, "link", "")),
-                    "ts": ts or 0,
-                })
-                cnt += 1
-        except Exception:
+                title = (getattr(e, "title", "") or "").strip()
+                link = getattr(e, "link", "") or ""
+                if title and link:
+                    items.append({"title": title, "link": link, "ts": ts or 0})
+        except Exception as ex:
+            logging.warning("RSS error for %s: %s", url, ex)
             continue
-
-    # score by recency + keyword boost
-    def score(it):
-        bonus = 0
-        if boost_keywords and keyword_hit(it["title"], boost_keywords):
-            bonus = 6 * 3600
-        return (it["ts"] or 0) + bonus
-
-    items.sort(key=score, reverse=True)
-
-    # de-dupe by normalized title
+    items.sort(key=lambda x: x["ts"], reverse=True)
     seen, uniq = set(), []
     for it in items:
-        key = it["title"].lower()
-        if key not in seen:
-            seen.add(key)
+        if it["title"] not in seen:
+            seen.add(it["title"])
             uniq.append(it)
-        if len(uniq) >= total_limit:
+        if len(uniq) >= n:
             break
     return uniq
 
-# ------------------------------ Brief builder ---------------------------------
-def build_brief():
-    kev = get_kev()
-    epss = get_epss()
-    kev_set = {k["cve"] for k in kev}
-    epss_only = [e for e in epss if e["cve"] not in kev_set][:EPSS_LIMIT]
+def build_brief() -> str:
+    try:
+        kev = get_kev_last_24h()
+    except Exception as ex:
+        logging.exception("KEV fetch failed: %s", ex)
+        kev = []
 
-    headlines = parse_feeds(HEADLINE_FEEDS, HEADLINES_WINDOW_DAYS, HEADLINES_TOTAL,
-                            max_per_source=FEED_MAX_PER_SOURCE, boost_keywords=HEADLINE_KEYWORDS)
-    vendor_news = parse_feeds(VENDOR_FEEDS, VENDOR_WINDOW_DAYS, VENDOR_TOTAL,
-                              max_per_source=FEED_MAX_PER_SOURCE, boost_keywords=STACK_KEYWORDS)
+    try:
+        epss = get_epss_high()
+    except Exception as ex:
+        logging.exception("EPSS fetch failed: %s", ex)
+        epss = []
+
+    kev_set = {k["cve"] for k in kev}
+    epss_only = [e for e in epss if e["cve"] not in kev_set][:5]
+
+    try:
+        hl = safe_top_headlines(HEADLINES_TO_INCLUDE)
+    except Exception as ex:
+        logging.exception("Headlines failed: %s", ex)
+        hl = []
 
     lines = []
-    lines.append(f"Daily DevSecOps brief — {now_local().strftime('%Y-%m-%d %H:%M')} {LOCAL_TZ}")
-
-    # KEV
+    lines.append("Daily DevSecOps brief")
     lines.append("")
-    lines.append(f"Known Exploited (last {KEV_WINDOW_DAYS}d):")
+    lines.append("Exploited now:")
     if kev:
-        for k in kev[:12]:
-            vendor = esc(k.get("vendor") or "")
-            product = esc(k.get("product") or "")
-            desc = esc(k.get("desc") or "")
-            stack = " | YOUR-STACK" if keyword_hit(f"{vendor} {product} {desc}", STACK_KEYWORDS) else ""
-            lines.append(f"- {k['cve']} — {vendor}/{product}: {desc}{stack} | Action: Patch/mitigate, add detection.")
+        for k in kev[:5]:
+            lines.append(f"- {k['cve']} — {k['vendor']}/{k['product']}: {k['desc']} | Action: Patch/mitigate, add detection.")
     else:
-        lines.append("- (No new KEV entries in window)")
+        lines.append("- (No new KEV entries in last 24h)")
 
-    # EPSS
     lines.append("")
-    lines.append(f"High-likelihood CVEs (EPSS ≥ {EPSS_MIN:.2f}, not in KEV):")
+    lines.append("High-likelihood CVEs:")
     if epss_only:
         for e in epss_only:
-            pct = int(round((e.get("pct") or 0) * 100))
+            pct = int(round(e["pct"] * 100))
             lines.append(f"- {e['cve']} — EPSS {e['epss']:.2f} (Pctl {pct}) | Action: Prioritize remediation/detection.")
     else:
-        lines.append("- (No EPSS candidates after KEV de-dup)")
+        lines.append("- (No EPSS ≥0.5 outside KEV worth noting)")
 
-    # Vendor advisories (from your curated feeds)
     lines.append("")
-    lines.append(f"Vendor advisories (last {VENDOR_WINDOW_DAYS}d):")
-    if vendor_news:
-        for it in vendor_news:
-            lines.append(f"- {it['title']} — {it['link']}")
-    else:
-        lines.append("- (No vendor advisories in window or no feeds configured)")
-
-    # Headlines
-    lines.append("")
-    lines.append(f"Security headlines (last {HEADLINES_WINDOW_DAYS}d):")
-    if headlines:
-        for it in headlines:
-            lines.append(f"- {it['title']} — {it['link']}")
+    lines.append("Situational awareness:")
+    if hl:
+        for h in hl:
+            lines.append(f"- {h['title']} — {h['link']}")
     else:
         lines.append("- (No headlines available)")
 
-    # Controls of the day
-    lines.append("")
-    lines.append("Controls today:")
-    lines.append("• Fast-track KEV patching; restrict exposed edge apps until patched.")
-    lines.append("• Validate internet exposure: VPNs/gateways, Exchange/OWA, Confluence, Git* servers.")
-    lines.append("• Detections: auth anomalies, webshell writes, sudden service restarts.")
-    lines.append("• Backups: confirm recent, offline/immutable for RCE/priv-esc impacted systems.")
-
     msg = "\n".join(lines)
-    return msg[:TELEGRAM_MAX]
+    if len(msg) > MAX_MSG_LEN:
+        msg = msg[:MAX_MSG_LEN]
+    return msg
 
-# ------------------------------ Telegram sender -------------------------------
-def send_telegram(text: str):
+def send_telegram(text: str) -> Dict:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_ids = []
-    if os.getenv("TELEGRAM_CHAT_IDS"):
-        chat_ids = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS").split(",") if c.strip()]
-    elif os.getenv("TELEGRAM_CHAT_ID"):
-        chat_ids = [os.getenv("TELEGRAM_CHAT_ID")]
-    else:
-        raise RuntimeError("No TELEGRAM_CHAT_ID or TELEGRAM_CHAT_IDS provided.")
-
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks = split_chunks(text)
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+        # No parse_mode to avoid accidental Markdown formatting issues
+    }
+    r = S.post(url, data=payload, timeout=30)
+    try:
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        logging.error("Telegram error %s: %s", r.status_code, r.text[:300])
+        raise
 
-    for cid in chat_ids:
-        for i, chunk in enumerate(chunks, 1):
-            r = SESSION.post(url, data={"chat_id": cid, "text": chunk, "disable_web_page_preview": True}, timeout=30)
-            if r.status_code >= 400:
-                print(f"[telegram] ERROR {r.status_code} {r.text}")
-            r.raise_for_status()
-            time.sleep(0.3)
-
-# ----------------------------------- Main -------------------------------------
 if __name__ == "__main__":
-    if not within_0830_guard():
-        print("[guard] Not within 08:30 window; exiting.")
-        raise SystemExit(0)
-
     brief = build_brief()
+    print(brief)  # visible in CI logs
     send_telegram(brief)
