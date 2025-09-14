@@ -1,4 +1,4 @@
-import os, re, html, time, math, json
+import os, re, time, html
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -11,39 +11,40 @@ try:
 except Exception:
     feedparser = None
 
-###############################################################################
-# Config (env overrides)
-###############################################################################
+# ----------------------------- Config (env) -----------------------------------
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Riga")
-STRICT_0830 = os.getenv("STRICT_0830", "0") == "1"   # only send around 08:30 local if true
-STRICT_0830_TOL_MIN = int(os.getenv("STRICT_0830_TOL_MIN", "6"))  # +/- window minutes
+
+# Schedule guard (off by default). Turn on with STRICT_0830=1 if you add dual-cron.
+STRICT_0830 = os.getenv("STRICT_0830", "0") == "1"         # send only ~08:30 local
+STRICT_0830_TOL_MIN = int(os.getenv("STRICT_0830_TOL_MIN", "7"))  # +/- minutes
 SKIP_WEEKENDS = os.getenv("SKIP_WEEKENDS", "0") == "1"
 
-KEV_WINDOW_DAYS = int(os.getenv("KEV_WINDOW_DAYS", "3"))   # KEV lookback
-EPSS_MIN = float(os.getenv("EPSS_MIN", "0.7"))
-EPSS_LIMIT = int(os.getenv("EPSS_LIMIT", "12"))
+# Data knobs
+KEV_WINDOW_DAYS = int(os.getenv("KEV_WINDOW_DAYS", "3"))    # lookback for KEV
+EPSS_MIN = float(os.getenv("EPSS_MIN", "0.7"))              # min EPSS
+EPSS_LIMIT = int(os.getenv("EPSS_LIMIT", "10"))             # max EPSS (post de-dup)
+FEED_COUNT = int(os.getenv("FEED_COUNT", "4"))              # # of headlines
 
-FEED_COUNT = int(os.getenv("FEED_COUNT", "4"))
+# Headlines scoring keywords (lowercase contains match)
 HEADLINE_KEYWORDS = [s.strip() for s in os.getenv(
     "HEADLINE_KEYWORDS",
-    "0-day,zero-day,actively exploited,exploited,exploit,weaponized,keV,cisa,patch tuesday,ransomware,supply chain"
+    "0-day,zero-day,actively exploited,exploited,exploit,weaponized,kev,cisa,patch tuesday,ransomware,supply chain"
 ).split(",") if s.strip()]
 
-# Highlight stack-relevant tech/vendors (comma-separated, case-insensitive)
+# Stack-relevant words to highlight (lowercase contains match)
 STACK_KEYWORDS = [s.strip() for s in os.getenv(
     "STACK_KEYWORDS",
-    "microsoft,cisco,fortinet,ivanti,citrix,gitlab,git,jenkins,atlassian,confluence,vmware,exchange,sharepoint,globalprotect,pan-os,big-ip,f5,moveit,screenconnect,sonicwall"
+    "microsoft,cisco,fortinet,ivanti,citrix,gitlab,jenkins,atlassian,confluence,vmware,exchange,sharepoint,globalprotect,pan-os,big-ip,f5,moveit,screenconnect,sonicwall,cloudflare,aws,azure,gcp,okta,git,nginx,apache"
 ).split(",") if s.strip()]
 
-# Multiple chat IDs supported: "12345,-10055555"
+# Telegram
 TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS")  # optional; overrides TELEGRAM_CHAT_ID
+TELEGRAM_MAX = 3900  # safe under Telegram’s 4096 limit
 
-TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML")  # HTML or MarkdownV2
-TELEGRAM_MAX = 3900  # keep below Telegram 4096 w/ some margin
-
+# ----------------------------- Sources ----------------------------------------
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+# we’ll still filter client-side, but server-side filter helps
 EPSS_URL = f"https://api.first.org/data/v1/epss?epss-gt={EPSS_MIN}&order=!epss&limit=1000"
-CIRCL_CVE_URL = "https://cve.circl.lu/api/cve/{}"
 
 HEADLINE_FEEDS = [
     "https://www.bleepingcomputer.com/feed/",
@@ -54,25 +55,21 @@ HEADLINE_FEEDS = [
     "https://aws.amazon.com/blogs/security/feed/",
 ]
 
-###############################################################################
-# HTTP session with retries
-###############################################################################
+# ----------------------------- HTTP session -----------------------------------
 def make_session():
     s = requests.Session()
-    retries = Retry(
+    r = Retry(
         total=3, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"]
     )
-    s.headers.update({"User-Agent": "DevSecOpsBrief/2.0 (+github-actions)"})
-    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.headers.update({"User-Agent": "DevSecOpsBrief/Pro/1.0 (+github-actions)"})
     return s
 
 SESSION = make_session()
 
-###############################################################################
-# Helpers
-###############################################################################
+# ----------------------------- Helpers ----------------------------------------
 def now_local():
     return datetime.now(ZoneInfo(LOCAL_TZ))
 
@@ -84,65 +81,29 @@ def within_0830_guard():
         return False
     return (n.hour == 8) and (abs(n.minute - 30) <= STRICT_0830_TOL_MIN)
 
-def html_escape(s: str) -> str:
-    return html.escape(s or "", quote=False)
+def esc(s: str) -> str:
+    return (s or "").replace("\r", "").strip()
 
-def split_chunks(text: str, limit: int = TELEGRAM_MAX):
-    """Split text into chunks respecting paragraph boundaries."""
-    parts = []
+def split_chunks(text: str, limit=TELEGRAM_MAX):
     if len(text) <= limit:
         return [text]
-    lines = text.split("\n")
-    buf = []
-    cur_len = 0
-    for ln in lines:
+    parts, buf, cur = [], [], 0
+    for ln in text.split("\n"):
         ln_len = len(ln) + 1
-        if cur_len + ln_len > limit and buf:
+        if cur + ln_len > limit and buf:
             parts.append("\n".join(buf))
-            buf, cur_len = [], 0
+            buf, cur = [], 0
         buf.append(ln)
-        cur_len += ln_len
+        cur += ln_len
     if buf:
         parts.append("\n".join(buf))
     return parts
-
-def tag_flags(text: str):
-    """Simple NLP-ish flags from description/summary."""
-    t = (text or "").lower()
-    flags = []
-    patterns = [
-        ("RCE", r"remote code execution|arbitrary code execution|code execution"),
-        ("AUTH-BYPASS", r"authentication bypass|bypass authentication|unauthenticated"),
-        ("PRIV-ESC", r"privilege escalation|elevation of privilege|eop"),
-        ("SQLi", r"sql injection"),
-        ("DESERIALIZATION", r"deserializ"),
-        ("SSRF", r"\bssrf\b|server-side request forgery"),
-        ("TRAVERSAL", r"path traversal|directory traversal"),
-        ("XXE", r"\bxxe\b|xml external entity"),
-        ("XSS", r"cross[- ]site scripting|\bxss\b"),
-        ("LFI/RFI", r"local file inclusion|remote file inclusion|\b(rfi|lfi)\b"),
-        ("INJECTION", r"injection"),
-    ]
-    for name, pat in patterns:
-        if re.search(pat, t):
-            flags.append(name)
-    # Internet-exposed tech hints
-    exposed = [
-        "vpn","ssl vpn","gateway","reverse proxy","edge","exchange","owa","sharepoint",
-        "confluence","jira","gitlab","jenkins","fortinet","pulse secure","globalprotect",
-        "pan-os","big-ip","f5","netscaler","citrix","moveit","screenconnect","sonicwall"
-    ]
-    if any(w in t for w in exposed):
-        flags.insert(0, "INTERNET-EXPOSED")
-    return flags
 
 def keyword_hit(s: str, keywords):
     t = (s or "").lower()
     return any(k in t for k in keywords)
 
-###############################################################################
-# Data collectors
-###############################################################################
+# ----------------------------- Data collectors --------------------------------
 def get_kev(window_days=KEV_WINDOW_DAYS):
     since = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
     r = SESSION.get(KEV_URL, timeout=30)
@@ -150,7 +111,7 @@ def get_kev(window_days=KEV_WINDOW_DAYS):
     vulns = r.json().get("vulnerabilities", [])
     out = []
     for v in vulns:
-        if v.get("dateAdded", "") >= since:
+        if (v.get("dateAdded") or "") >= since:
             out.append({
                 "cve": v.get("cveID"),
                 "vendor": v.get("vendorProject"),
@@ -159,8 +120,7 @@ def get_kev(window_days=KEV_WINDOW_DAYS):
                 "dateAdded": v.get("dateAdded"),
                 "dueDate": v.get("dueDate"),
             })
-    # Stable sort: newer first
-    out.sort(key=lambda x: (x.get("dateAdded") or "", x["cve"]), reverse=True)
+    out.sort(key=lambda x: (x.get("dateAdded") or "", x.get("cve") or ""), reverse=True)
     return out
 
 def get_epss():
@@ -174,39 +134,10 @@ def get_epss():
             pct = float(d.get("percentile", "0"))
         except Exception:
             continue
-        out.append({"cve": d.get("cve"), "epss": epss, "pct": pct})
+        if epss >= EPSS_MIN:
+            out.append({"cve": d.get("cve"), "epss": epss, "pct": pct})
     out.sort(key=lambda x: x["epss"], reverse=True)
     return out
-
-def enrich_cve(cve_id: str):
-    """Best-effort enrichment via CIRCL (CVSS, CWE, summary)."""
-    try:
-        r = SESSION.get(CIRCL_CVE_URL.format(cve_id), timeout=15)
-        if r.status_code != 200:
-            return {}
-        j = r.json()
-        # CIRCL can return {} or not found
-        if not isinstance(j, dict) or "id" not in j:
-            return {}
-        cvss3 = None
-        if isinstance(j.get("cvss3"), (int, float, str)):
-            try:
-                cvss3 = float(j["cvss3"])
-            except Exception:
-                cvss3 = None
-        vector = j.get("cvss3_vector") or j.get("vectorString")
-        cwe = j.get("cwe")
-        summary = j.get("summary")
-        refs = j.get("references", []) or []
-        return {
-            "cvss3": cvss3,
-            "vector": vector,
-            "cwe": cwe,
-            "summary": summary,
-            "ref1": refs[0] if refs else None
-        }
-    except Exception:
-        return {}
 
 def safe_top_headlines(n=FEED_COUNT):
     if not feedparser:
@@ -221,21 +152,17 @@ def safe_top_headlines(n=FEED_COUNT):
                     ts = time.mktime(e.published_parsed)
                 elif getattr(e, "updated_parsed", None):
                     ts = time.mktime(e.updated_parsed)
-                items.append({
-                    "title": (e.title or "").strip(),
-                    "link": e.link,
-                    "ts": ts,
-                })
+                items.append({"title": esc(getattr(e, "title", "")), "link": esc(getattr(e, "link", "")), "ts": ts})
         except Exception:
             continue
-    # Score headlines by recency + keyword presence
+
+    # score recency + keyword boost
     def score(it):
-        base = it["ts"]
-        bonus = 60 * 60 * 6 if keyword_hit(it["title"], HEADLINE_KEYWORDS) else 0
-        return base + bonus
-    items.sort(key=score, reverse=True)
+        bonus = 6 * 3600 if keyword_hit(it["title"], HEADLINE_KEYWORDS) else 0
+        return (it["ts"] or 0) + bonus
 
     # de-dup by normalized title
+    items.sort(key=score, reverse=True)
     seen, uniq = set(), []
     for it in items:
         key = it["title"].lower()
@@ -246,137 +173,66 @@ def safe_top_headlines(n=FEED_COUNT):
             break
     return uniq
 
-###############################################################################
-# Brief builder
-###############################################################################
+# ----------------------------- Brief builder ----------------------------------
 def build_brief():
     kev = get_kev()
     epss = get_epss()
 
     kev_set = {k["cve"] for k in kev}
     epss_only = [e for e in epss if e["cve"] not in kev_set][:EPSS_LIMIT]
-
-    # Enrich KEV + EPSS-only with CVSS/CWE & flags
-    def annotate(item, base_desc=None):
-        cve = item["cve"]
-        enrich = enrich_cve(cve)
-        desc = enrich.get("summary") or base_desc or ""
-        flags = tag_flags((desc or "") + " " + (base_desc or ""))
-        sev = ""
-        if enrich.get("cvss3") is not None:
-            try:
-                cv = float(enrich["cvss3"])
-                if cv >= 9.0: sev = "CRITICAL"
-                elif cv >= 7.0: sev = "HIGH"
-                elif cv >= 4.0: sev = "MEDIUM"
-                else: sev = "LOW"
-            except Exception:
-                pass
-        item.update({
-            "desc": desc or base_desc or "",
-            "flags": flags,
-            "cvss3": enrich.get("cvss3"),
-            "severity": sev,
-            "vector": enrich.get("vector"),
-            "cwe": enrich.get("cwe"),
-            "ref": enrich.get("ref1"),
-        })
-        return item
-
-    kev = [annotate(dict(k), k.get("desc")) for k in kev]
-    epss_only = [annotate(dict(e)) for e in epss_only]
-
-    # Prioritize stack-relevant items to the top of each list
-    def sort_key(item):
-        w = 0
-        base_text = " ".join([str(item.get("vendor","")), str(item.get("product","")), item.get("desc","")]).lower()
-        if keyword_hit(base_text, STACK_KEYWORDS):
-            w += 1000
-        if "INTERNET-EXPOSED" in item.get("flags", []):
-            w += 500
-        if "RCE" in item.get("flags", []):
-            w += 250
-        if item.get("severity") == "CRITICAL":
-            w += 200
-        try:
-            w += int((item.get("epss") or 0) * 100)  # 0..100
-        except Exception:
-            pass
-        # newer KEV first
-        w += 10 if item.get("dateAdded") else 0
-        return -w
-
-    kev.sort(key=sort_key)
-    epss_only.sort(key=sort_key)
-
     hl = safe_top_headlines(FEED_COUNT)
 
-    # Render HTML message
+    # Header
     lines = []
-    lines.append("<b>Daily DevSecOps brief</b>")
-    lines.append(f"<i>Local time: {html_escape(now_local().strftime('%Y-%m-%d %H:%M'))} ({LOCAL_TZ})</i>")
+    lines.append(f"Daily DevSecOps brief — {now_local().strftime('%Y-%m-%d %H:%M')} {LOCAL_TZ}")
 
     # KEV
     lines.append("")
-    lines.append(f"<b>Known Exploited (last {KEV_WINDOW_DAYS}d)</b>")
+    lines.append(f"Known Exploited (last {KEV_WINDOW_DAYS}d):")
     if kev:
         for k in kev[:12]:
-            tags = " ".join(f"[{t}]" for t in k.get("flags", []))
-            sev = f" | CVSS {k['cvss3']:.1f} {k['severity']}" if k.get("cvss3") is not None else ""
-            stack = " | <b>YOUR STACK</b>" if keyword_hit(" ".join([str(k.get("vendor","")), str(k.get("product","")), k.get("desc","")]), STACK_KEYWORDS) else ""
-            ref = f" — <a href='{html_escape(k['ref'])}'>ref</a>" if k.get("ref") else ""
-            base = f"- <b>{html_escape(k['cve'])}</b> — {html_escape(k.get('vendor',''))}/{html_escape(k.get('product',''))}: {html_escape(k.get('desc'))}"
-            extra = f" | Action: Patch/mitigate, add detection{sev}{stack}{ref}"
-            if tags:
-                extra = f" {html_escape(tags)}{extra}"
-            lines.append(base + extra)
+            vendor = esc(k.get("vendor") or "")
+            product = esc(k.get("product") or "")
+            desc = esc(k.get("desc") or "")
+            stack = " | YOUR-STACK" if keyword_hit(f"{vendor} {product} {desc}", STACK_KEYWORDS) else ""
+            lines.append(f"- {k['cve']} — {vendor}/{product}: {desc}{stack} | Action: Patch/mitigate, add detection.")
     else:
-        lines.append("- (No new KEV items in window)")
+        lines.append("- (No new KEV entries in window)")
 
     # EPSS
     lines.append("")
-    lines.append(f"<b>High-likelihood CVEs (EPSS ≥ {EPSS_MIN:.2f}, not in KEV)</b>")
+    lines.append(f"High-likelihood CVEs (EPSS ≥ {EPSS_MIN:.2f}, not in KEV):")
     if epss_only:
         for e in epss_only:
             pct = int(round((e.get("pct") or 0) * 100))
-            tags = " ".join(f"[{t}]" for t in e.get("flags", []))
-            sev = f" | CVSS {e['cvss3']:.1f} {e['severity']}" if e.get("cvss3") is not None else ""
-            ref = f" — <a href='{html_escape(e['ref'])}'>ref</a>" if e.get("ref") else ""
-            hot = "🔥" if (e.get("epss") or 0) >= 0.9 else ""
-            extra = f" | EPSS {e.get('epss',0):.2f} (Pctl {pct}){sev}"
-            base = f"- {hot}<b>{html_escape(e['cve'])}</b>: {html_escape(e.get('desc',''))}"
-            if tags:
-                extra = f" {html_escape(tags)}{extra}"
-            lines.append(base + extra + ref + " | Action: Prioritize remediation/detection.")
+            lines.append(f"- {e['cve']} — EPSS {e['epss']:.2f} (Pctl {pct}) | Action: Prioritize remediation/detection.")
     else:
-        lines.append("- (No EPSS candidates after de-duplication with KEV)")
+        lines.append("- (No EPSS candidates after KEV de-dup)")
 
     # Headlines
     lines.append("")
-    lines.append("<b>Situational awareness</b>")
+    lines.append("Situational awareness:")
     if hl:
         for h in hl:
-            title = html_escape(h["title"])
-            link = html_escape(h["link"])
-            lines.append(f"- <a href='{link}'>{title}</a>")
+            title = esc(h["title"])
+            link = esc(h["link"])
+            lines.append(f"- {title} — {link}")
     else:
         lines.append("- (No headlines available)")
 
-    # Add a compact “Controls to apply today”—generic & safe
+    # Controls of the day (tight, actionable)
     lines.append("")
-    lines.append("<b>Controls to apply today</b>")
-    lines.append("• Validate internet exposure for VPNs, gateways, and collaboration apps (Exchange/OWA, Confluence, GitLab, Jenkins).")
-    lines.append("• Patch window: fast-track KEV items; temporarily restrict public access where feasible.")
-    lines.append("• Detection: watch for suspicious auth, webshell drops, and device reboots/ha resets after patching.")
-    lines.append("• Block: known bad IPs/domains from vendor advisories where available; monitor outbound to paste/file-sharing.")
-    lines.append("• Backup: verify recent, offline/immutable copies for critical apps impacted by RCE/priv-esc vulns.")
+    lines.append("Controls today:")
+    lines.append("• Fast-track KEV patching; restrict public access for impacted edge apps until patched.")
+    lines.append("• Validate internet exposure for VPNs, gateways, Exchange/OWA, Confluence, Git* servers.")
+    lines.append("• Deploy detections: auth anomalies, webshell writes, unexpected service restarts.")
+    lines.append("• Backups: confirm recent, offline/immutable for systems tied to RCE/priv-esc CVEs.")
 
     msg = "\n".join(lines)
-    return msg
+    # keep safe under Telegram cap
+    return msg[:TELEGRAM_MAX]
 
-###############################################################################
-# Telegram sender
-###############################################################################
+# ----------------------------- Telegram sender --------------------------------
 def send_telegram(text: str):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id_single = os.environ.get("TELEGRAM_CHAT_ID")
@@ -386,35 +242,28 @@ def send_telegram(text: str):
     elif chat_id_single:
         chat_ids = [chat_id_single]
     else:
-        raise RuntimeError("No TELEGRAM_CHAT_ID or TELEGRAM_CHAT_IDS env provided.")
+        raise RuntimeError("No TELEGRAM_CHAT_ID or TELEGRAM_CHAT_IDS provided.")
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payloads = []
-    for chunk in split_chunks(text):
-        payloads.append({
-            "text": chunk,
-            "parse_mode": TELEGRAM_PARSE_MODE,
-            "disable_web_page_preview": True
-        })
+    chunks = split_chunks(text)
 
     results = []
     for cid in chat_ids:
-        for p in payloads:
-            data = {"chat_id": cid, **p}
-            r = SESSION.post(url, data=data, timeout=30)
+        for i, chunk in enumerate(chunks, 1):
+            payload = {"chat_id": cid, "text": chunk, "disable_web_page_preview": True}
+            r = SESSION.post(url, data=payload, timeout=30)
+            if r.status_code >= 400:
+                # surface error in logs; raise for visibility in Actions
+                print(f"[telegram] ERROR {r.status_code} {r.text}")
             r.raise_for_status()
             results.append(r.json())
-            # small pause to avoid flood-limits if multiple chunks
-            time.sleep(0.5)
+            time.sleep(0.3)
     return results
 
-###############################################################################
-# Main
-###############################################################################
+# --------------------------------- Main ---------------------------------------
 if __name__ == "__main__":
     if not within_0830_guard():
-        # Quiet exit if guard is enabled and not the window we want
-        # (Use dual-CRON 05:30/06:30 UTC so it always lands on 08:30 Riga year-round)
+        print("[guard] Not within 08:30 window; exiting.")
         raise SystemExit(0)
 
     brief = build_brief()
