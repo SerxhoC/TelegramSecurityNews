@@ -14,12 +14,46 @@ jobs:
       - run: pip install -r requirements.txt
       - env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}   # or TELEGRAM_CHAT_ID
+          # One or many destinations:
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # or:
+          # TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}  # e.g., "12345,-1005555"
+
+          # Timezone/guard
           LOCAL_TZ: Europe/Riga
           STRICT_0830: '1'
+          STRICT_0830_TOL_MIN: '7'
           SKIP_WEEKENDS: '0'
+
+          # KEV/EPSS knobs
           KEV_WINDOW_DAYS: '3'
           EPSS_MIN: '0.7'
           EPSS_LIMIT: '12'
-          FEED_COUNT: '4'
+
+          # News windows/limits
+          HEADLINES_TOTAL: '6'
+          VENDOR_TOTAL: '10'
+          FEED_MAX_PER_SOURCE: '6'
+          HEADLINES_WINDOW_DAYS: '3'
+          VENDOR_WINDOW_DAYS: '3'
+
+          # Ranking & stack awareness
+          HEADLINE_KEYWORDS: '0-day,zero-day,actively exploited,exploited,exploit,weaponized,kev,cisa,patch tuesday,ransomware,supply chain'
+          STACK_KEYWORDS: 'microsoft,cisco,fortinet,ivanti,citrix,gitlab,jenkins,atlassian,confluence,vmware,exchange,sharepoint,globalprotect,pan-os,big-ip,f5,moveit,screenconnect,sonicwall,cloudflare,aws,azure,gcp,okta,nginx,apache'
+
+          # Feeds — newline or comma separated
+          HEADLINE_FEEDS: |
+            https://www.bleepingcomputer.com/feed/
+            https://www.darkreading.com/rss.xml
+            https://therecord.media/feed
+            https://www.microsoft.com/en-us/security/blog/feed/
+            https://blog.google/threat-analysis-group/rss/
+            https://aws.amazon.com/blogs/security/feed/
+
+          # Fill with YOUR vendor advisory/news RSS feeds (examples below are placeholders; replace with verified RSS URLs)
+          VENDOR_FEEDS: |
+            # Replace these with your verified vendor advisory RSS/Atom feeds
+            # https://<VENDOR>/security-advisories/rss
+            # https://<VENDOR>/psirt/advisories/rss
+            # https://<VENDOR>/blog/security/feed/
         run: python telegram_brief.py
